@@ -291,8 +291,6 @@ var mimicModule = mimicModule || (function(){
 		};
 	})();
 	
-	//	enforce persistent data as a singleton member of state	
-	state.mimicMsgStore = {}; // old stuff
 
 	// script reporting to user
 	var sendNote = function(noticeString, msgOrigin, whofrom) {
