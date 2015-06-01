@@ -1,7 +1,7 @@
 /****
 
 mimic - a roll20.net api script to teach any selected token to reproduce any player chat message.
-version: 0.2 alpha May 15 2015
+version: 0.3 beta Jun 1 2015
 author:  Ed B. My first roll20 script!
          function fixupCommand donated by manveti
          additional code design advice thanks to The Aaron and Brian but the bad stuff is all on me. 
@@ -15,32 +15,31 @@ cmd is one of:
     -buttons install example of useful token buttons for !mimic. GM only.
     -dump dump all learned actions to the log for debugging. GM only
     -reset recover state space by forgetting all learned actions. GM only.
-    *-clean recover state space by forgetting actions of deleted tokens. GM only.
+    -clean recover state space by forgetting actions of deleted tokens. GM only.
 opts are:
-    ***-n where n is a single digit 0-9. Use token's nth of 10 action memories. Default is memory 0.
-    *-whisper force the token to whisper to the gm. also whisper script notifications to gm.
+ ***-n where n is a single digit 0-9. Use token's nth of 10 action memories. Default is memory 0.
+ -whisper force the token to whisper to the gm. also whisper script notifications to gm.
               useful to test a token's command memory without alerting players.
-    *-shout force the token to NOT whisper. Useful when the token was taught by whisper-ing.
-    -quiet suppress all chat notification of script activity
+ -shout force the token to NOT whisper. Useful when the token was taught by whisper-ing.
+ -quiet suppress all chat notification of script activity
+ -bar1 [or -bar2 or -bar3] decrement bar value when you do a perform. For ammo tracking
 
-*** == NOT YET IMPLEMENTED
-* === NOT YET TESTED
+ *** == NOT YET IMPLEMENTED
+ * === NOT YET TESTED
 
 Coding strategy:
-  1. last player msg stores in state assoc
-  2. selected token learns message by copying players last messg to state assoc
-  3. selected token finds its learned message in state assoc
+  1. last player msg stored
+  2. token learns message by copying players to persistent wrapper
+  3. token perform message from wrapper data
 
 KNOWN ISSUES:
-// whisper only goes to GM from apis. Can't whisper to players
 // token prevented from learing api calls. Prevents cascade failures 
            in learning/performing cycles
 //         also prevents strange api interaction.
 // mimic gets confused by some obscure chat sequences, but apparently keeps on truckin'.
 // not sure the way I'm applying template is comprehensive. I only do D&D 5e and that works. What about powercard, etc?
 // Tried attaching directly to objects instead of using state, but data would
-not persist. Need to consider re-write switching back to object approach by 
-wrapping the token objects with a generalized state object. Then we could really enhance tokens!
+not persist. Wrapping the token objects with a generalized state object. 
 // dev team could inform if there'a a hook to check on how much state space I'm taking up. 
 What happens if I blow this up?
 // copying a token is going to be a pain to code. No way to tell what was selected. 
@@ -60,9 +59,14 @@ done // make sure re-rolls do not cascade (?who)
 too messy // create a shortcut with backquote-command
 // confirm clean operation works
 
-// Next Ed.B. project: ammo tracker that gloms onto attack rolls. looks like a few 
-similar ammo scripts out there. Maybe I can hack them to suit.
-*****/
+done // code revisions suggested by Aaron re undefined and calls
+done // fix whispers back to player
+// decrement on a bar
+// exclude character tokens
+// add a "*no selected token*" memory slot; not sure what message should be. 
+Will disappear on cleaning.
+
+***/
 
 var edMsgUtils = edMsgUtils || (function(){
 
@@ -92,6 +96,18 @@ var edMsgUtils = edMsgUtils || (function(){
 	}
 
 	function prefixCmd(msg) {
+		function targTrimName(msg){
+			// whisper only works on trimmed name of a player as of May 2015
+			// when fixed, this will work on target_name
+			// return '/w "' + msg.target_name + '" ';
+			if( ! msg.target ) return "";
+			if( msg.target === "gm" ) return "gm";
+			// multiple targets if a character whisper - pick first entry from targets
+			var targPlayer = getObj('player', msg.target.split(",")[0] );
+			if(!targPlayer) return "gm"; // error
+			return targPlayer.get('_displayname').split(/\s+/)[0];						
+		}
+
 		// return ""; // fix this code
 		switch (msg.type) {
 		case "rollresult":
@@ -100,9 +116,8 @@ var edMsgUtils = edMsgUtils || (function(){
 			return "/gmroll "; // reproduce /gmroll
 		case "emote":
 			return "/em "; // reproduce /emote
-			// case "whisper": return "/w \"" + msg.target_name + "\" "; // reproduce /w
-		case "whisper":
-			return "/w GM "; // until whisper to characters is available
+		case "whisper":			
+			return "/w " + targTrimName(msg) + " "; // until whisper to characters is available
 		case "desc":
 			return "/desc ";
 		case "api":
@@ -120,7 +135,8 @@ var edMsgUtils = edMsgUtils || (function(){
 	// (1) no way to detect a backquote literal message, macro, api or ability/attr calls
 	// (2) some types are not reconstructable exactly: /gmroll /as /emas / for example
 	// (3) inline rolls are not expanded correctly if the playerid is API ?? weird ??
-	// (4) whispers to player don't work on the server side api as of May 10 2015
+	// (4) whispers to character don't work on the server side api as of May 10 2015
+	// (5) I am unclear as to whispers to multiple players, does it exist outside of characters, hard to mimic
 	var msgToCmdstring = function(msg) {
 		switch (msg.type) {
 		case "rollresult": // reproduce /r /roll
@@ -157,7 +173,7 @@ var edMsgUtils = edMsgUtils || (function(){
 		}		
 		return msg;
 	}
-	
+
 	function dewhisperize(msg){
 		// destructively convert message to NOT whisper
 		switch(msg.type){
@@ -177,84 +193,140 @@ var edMsgUtils = edMsgUtils || (function(){
 		toShout : dewhisperize		
 	};	
 })();
-	
-var mimicModule = mimicModule || (function(){
-	
-    // the individual command opt flags for this script are stored in these c-variables.
-    // But this data has to be reset on each event since there is only one module object.
-    // I assume calls to the api are synchronized. If not, these option data need to
-    // be duplicated in separate evaluation contexts (new objects?) for each 
-    // api caller event and then synchronized. Now its classy, but not very OOP.  
 
-    var	cQuietFlag = false;
+var mimicModule = mimicModule || (function(){
+
+	// the individual command opt flags for this script are stored in these c-variables.
+	// But this data has to be reset on each event since there is only one module object.
+	// I assume calls to the api are synchronized. If not, these option data need to
+	// be duplicated in separate evaluation contexts (new objects?) for each 
+	// api caller event and then synchronized. Now its classy, but not very OOP.  
+
+	var	cQuietFlag = false;
 	var	cWhisperFlag = false;
 	var	cShoutFlag = false;
-	
+	var cBarNumber = null;
+
 	function acousticAdjust(msg){ //note _.clone is shallow
 		if(! msg ) return null;
 		if( cWhisperFlag ) return edMsgUtils.toWhisper(_.clone(msg));
 		if( cShoutFlag ) return edMsgUtils.toShout(_.clone(msg));
 		return msg;	
 	}	
-	
-	//	enforce persistent data as a singleton member of state	
-	var msgStorage = (function(){
-		function getStorage(key){ //	should have better check here for "not an object" test
-			if (!state.hasOwnProperty("mimicMsgStore"))	state.mimicMsgStore = {};
-			//if (Array.isArray(state.mimicMsgStore)) {
-			//	log("!mimic: converting from array");
-			//	state.mimicMsgStore = {};
-			//}
-			if(!key) return state.mimicMsgStore;
-			return state.mimicMsgStore[key] || null;
+
+	// persistent wappers for tokens maintained in roll20 state variable.
+	// graphic object are not persisted so, use this instead.
+	var pwTokens = (function(){
+		// tokens in state
+		if ( ! _.isObject(state.pwTokStorage) ) state.pwTokStorage = {};
+
+		function get_PWToken( tokid ){ // create if necessary
+			// check the state variable
+			if( state.pwTokStorage[tokid] ) return state.pwTokStorage[tokid];
+
+			var token = getObj('graphic', tokid);
+			if( token ){
+				var pwToken = new WrappedToken(tokid);
+				state.pwTokStorage[tokid] = pwToken;
+				return pwToken;
+			}
+			return null; // failed to find token
+		}
+
+		var WrappedToken = function( token_id ){
+			// this._token = token; // using token, but scared about deserialization
+			this._tokenid = token_id; // possibly this should be an _id, not a token ref, also allow GC
+			this.autoBarDec = null;  // permitted properties
+			this.learned = null;
 		};
-		function setStorage(key,val){
-			getStorage(); // make sure it exists
-			var oldval = state.mimicMsgStore[key] || null;
-			state.mimicMsgStore[key] = value;
-			return oldval;
+		WrappedToken.prototype.get = function( property ){  // accessors would be better. JS version?
+			if( _.has(this, property) ) return this[property];
+			return getObj('graphic',this._tokenid).get(property); // dereference and delegate to wrapped token
 		};
+		WrappedToken.prototype.set = function( property, value ){
+			if( _.has(this, property) ){
+				this[property] =  value;
+				return value;
+			}
+			else return getObj('graphic',this._tokenid).set( property, value ); // delegate
+		};
+
 		function resetStorage(){
-			state.mimicMsgStore = {};
+			state.pwTokStorage = {};
 		};
-		function cleanStorage(){ // delete keys that aren't roll20 objids
-			getStorage();
-			for (var objid in state.mimicMsgStore) {
-			    if (state.mimicMsgStore.hasOwnProperty(objid))
-			    	if(!getObj('graphic',objid) && !getObj('player',objid))
-			    		if(! delete state.mimicMsgStore[objid] )
-			    			log("!mimic script: JS delete failed in msgStorage.cleanStorage");
+		function cleanStorage(){ // delete keys that aren't roll20 tokens and restore prototypes
+			for (var objid in state.pwTokStorage) {
+				if (state.pwTokStorage.hasOwnProperty(objid))
+					if(getObj('graphic',objid)){ // restore prototypes HACK! NON STANDARD JS!
+						state.pwTokStorage[objid].__proto__ = WrappedToken.prototype;
+					}
+					else {
+						if(! delete state.pwTokStorage[objid] )
+							log("!mimic script: JS delete failed in pwTokens.cleanStorage");
+					}
 			}
 		};
+
 		return {
-			getStore : getStorage, // note to programmer: use getter/setter for this.
-			setStore : setStorage,
+			data : function(){ return state.pwTokStorage; }, // for debugging
+			reset : resetStorage,
 			clean : cleanStorage,
-			reset : resetStorage
+			getPWToken : get_PWToken
 		};
 	})();
 
-	var sendNotice = function(whofrom, noticeString, whoto) {
+	// object log last player message during a session; but doesn't have to be persistent.
+	var msgLog = (function(){
+		var msgHist = {}; // initialize log
+		return {
+			update : function (msg, logid){
+				logid = logid || msg.playerid;
+				oldlog = msgHist[logid];
+				msgHist[logid] = msg;
+				return oldlog;
+			},
+			retreive : function ( logid ){
+				return msgHist[logid];
+			}
+		};
+	})();
+	
+	//	enforce persistent data as a singleton member of state	
+	state.mimicMsgStore = {}; // old stuff
+
+	// script reporting to user
+	var sendNote = function(noticeString, msgOrigin, whofrom) {
 		// can't whisper to players form api as of May 2015, so unfortunately whoto doesn't work
 		// change to whisper to who when available.
 		if( cQuietFlag ) return;
+
 		var prefix = "";
-		if( cWhisperFlag ) prefix = "/w GM "; // only working whisper is GM
-		// upgrade when whisper available: 	if whoto, override cWhisperFlag with  prefix = "/w " + whoto
-		//          						if cShoutFlag, override whoto
+		if(!msgOrigin && cWhisperFlag ) prefix = "/w GM "; // don't know who to whisper => whisper to GM
+		if(msgOrigin){ // whisper back to origin
+			// check for GM first
+			if( msgOrigin.who.indexOf("(GM)") !== -1 ) prefix = "/w GM ";
+			else {	
+				var targPlayer = getObj('player', msgOrigin.playerid ); // don't use who - could be token or character
+				prefix = "/w " + targPlayer.get('_displayname').split(/\s+/)[0] + " ";
+			}
+		}
+		if( cShoutFlag ) prefix = ""; // if cShoutFlag, override whispers
+
 		whofrom = whofrom || "Mimic script" ;
 		sendChat(whofrom, prefix + noticeString);
 	};
 
 	var handleMsgInput = function(msg) {
-		
-		var msgStore = msgStorage.getStore();
-		
+
+		// var msgStore = msgStorage.getStore();
+
 		// if this is a player's message, put it in storage for later mimicing.
 		// Could put this in a separate handler from !mimic.
 		// No apis allowed prevents cascade failures. (this may be overly cautious.)	
 		if (msg.type !== "api" && 'playerid' in msg && msg.content.indexOf("!mimic") === -1) {
-			msgStore[msg.playerid] = msg; // not cloning it seems to persist OK.
+			// msgStore[msg.playerid] = msg; // not cloning it seems to persist OK.
+			// log(msg);
+			msgLog.update(msg); // log it
 			return; // only !mimic needs to make it further
 		}
 
@@ -264,156 +336,185 @@ var mimicModule = mimicModule || (function(){
 		var opFunc = performOperation; // reset defaults
 		cQuietFlag = false;
 		cWhisperFlag = false;
-		cShoutFlag = false;	
+		cShoutFlag = false;
+		cBarNumber = null;
+		
 		var operationCount = 0;
 
 		var args = msg.content.split(/\s+/);
-		
+
 		for(var i=1; i<args.length; i++)
-		  switch(args[i]){
-		  case "-dump":
-              opFunc = dumpOperation;
-              operationCount++;
-              break;
-		  case "-learn":
-              opFunc = learnOperation;
-              operationCount++;
-              break;
-		  case "-perform":
-			  opFunc = performOperation;
-			  operationCount++;
-			  break;
-		  case "-buttons":
-			  opFunc = buttonsOperation;
-			  operationCount++;
-			  break;
-		  case "-reset":
-			  opFunc = resetOperation;
-			  operationCount++;
-			  break;
-		  case "-clean":
-			  opFunc = cleanOperation;
-			  operationCount++;
-			  break;
-		  case "-shout":
-			  cShoutFlag = true;
-			  cWhisperFlag = false;
-			  break;
-		  case "-quiet":
-			  cQuietFlag = true;
-			  break;
-		  case "-whisper":
-			  cWhisperFlag = true;
-			  cShoutFlag = false;
-			  break;
-		  default:
-              operationCount++;
-			  opFunc = function(){ sendNotice("", "Unknown operation or command"); };
-		  }
-		
+			switch(args[i]){
+			case "-dump":
+				opFunc = dumpOperation;
+				operationCount++;
+				break;
+			case "-learn":
+				opFunc = learnOperation;
+				operationCount++;
+				break;
+			case "-perform":
+				opFunc = performOperation;
+				operationCount++;
+				break;
+			case "-buttons":
+				opFunc = buttonsOperation;
+				operationCount++;
+				break;
+			case "-reset":
+				opFunc = resetOperation;
+				operationCount++;
+				break;
+			case "-clean":
+				opFunc = cleanOperation;
+				operationCount++;
+				break;
+			case "-shout":
+				cShoutFlag = true;
+				cWhisperFlag = false;
+				break;
+			case "-quiet":
+				cQuietFlag = true;
+				break;
+			case "-whisper":
+				cWhisperFlag = true;
+				cShoutFlag = false;
+				break;
+			case "-bar3":
+				cBarNumber = "3";
+				break;
+			case "-bar2":
+				cBarNumber = "2";
+				break;
+			case "-bar1":
+				cBarNumber = "1";
+				break;
+			default:
+				operationCount++;
+			opFunc = function(){ sendNote("Unknown operation or command"); };
+			}
+
 		if(operationCount > 1){
-			sendNotice("","too many command options given.");
+			sendNote("too many command options given.");
 			return ;
 		}		
-        opFunc(msg);    
+		opFunc(msg);    
 	};
-   
+
 	function learnOperation(msg){
-		var msgStore = msgStorage.getStore();
+		// var msgStore = msgStorage.getStore();
 		if (!msg.playerid) { // learn only from the player, not other's messages
-			sendNotice("", "Tokens can only learn from a player");
+			sendNote("Tokens can only learn from a player");
 			return;
 		}
 		if (!msg.selected) {
-			sendNotice("", "No token selected");
+			sendNote("No token selected", msg);
 			return;
 		}
 		// fall through
-		_.each(msg.selected, function(tok) {
-			var learnerName = (getObj(tok._type, tok._id).get('name') + "-token-");
-			var playerLastMsg = msgStore[msg.playerid] || null;
+		_.each(msg.selected, function(sel) { // selections appear to be some truncated rep of graphics
+			var wtok = pwTokens.getPWToken(sel._id);
+			var learnerName = wtok.get('name') + "-token-";
+			var playerLastMsg = msgLog.retreive(msg.playerid);
 			if(! playerLastMsg )
-				sendNotice(learnerName, "Do something first, then I can learn to mimic it.");
+				sendNote("Do something first, then I can learn to mimic it.", msg, learnerName);
 			else {
-				msgStore[tok._id] = acousticAdjust(playerLastMsg);
-				sendNotice(learnerName,
-						"I am learning from " + getObj('player', msg.playerid).get("_displayname"));
+				wtok.set('learned', acousticAdjust(playerLastMsg));
+				wtok.set('autoBarDec', cBarNumber );
+				sendNote("I am learning from " + msg.who,  msg, learnerName); // getObj('player', msg.playerid).get("_displayname"),
 			}
 		});
 	};
-    
-    function performOperation(msg){
-		var msgStore = msgStorage.getStore();
+	
+	function autoBarDecrement(wtok, barOverride){
+		// work with the wrapped token to decrement the appropritae bar, per ammo
+		var barNum = barOverride || wtok.get('autoBarDec');
+		if(!barNum) return null;
+		var barPropName = "bar" + barNum + "_value";
+		var ammoVal = parseInt(wtok.get(barPropName));
+		if( _.isNaN(ammoVal)) ammoVal = 0;
+		wtok.set(barPropName, ammoVal -1);
+		return ammoVal -1;
+	}
+
+	function performOperation(msg){
+		// var msgStore = msgStorage.getStore();
 		if (!msg.selected) {
-			sendNotice(msg.who, "No token selected", msg.who);
+			sendNote("No token selected", msg);
 			return;
 		}
-    	_.each(msg.selected, function(tok) {
-			var performerName = (getObj(tok._type, tok._id).get('name') + "-token-");
-			if (msgStore[tok._id])
-				sendChat(performerName, edMsgUtils.Revert(acousticAdjust(msgStore[tok._id])));
+		_.each(msg.selected, function(sel) {
+			var wtok = pwTokens.getPWToken(sel._id);
+			var performerName = wtok.get('name') + "-token-";
+			var learned = wtok.get('learned');
+			if (learned){
+				sendChat(performerName, edMsgUtils.Revert(acousticAdjust(learned)));
+				autoBarDecrement(wtok, cBarNumber);
+			}
 			else
-				sendNotice(performerName, "I have not learned what performance to mimic");
+				sendNote("I have not learned what performance to mimic", msg, performerName);
 		});
-    };
-    
-    function dumpOperation(msg){ // for debugging
-    	// check for gm here
-    	if(!playerIsGM(msg.playerid)){
-    		sendNotice("", "dump operation is GM priviledged");
-    		return ;
-    	}
-		log(msgStorage.getStore());
-    };
-    
-    function resetOperation(){
-    	if(!playerIsGM(msg.playerid)){
-    		sendNotice("", "reset operation is GM priviledged");
-    		return ;
-    	}
-    	msgStorage.reset();
-    	sendNotice("", "Tokens now forget what they learned.");
-    }
+	};
 
-    function cleanOperation(){
-    	if(!playerIsGM(msg.playerid)){
-    		sendNotice("", "clean operation is GM priviledged");
-    		return ;
-    	}
-    	msgStorage.clean();
-    	sendNotice("", "Deleted token memory clean-up finished.");
-    };
-    
-    function buttonsOperation(msg){
-    	if(!playerIsGM(msg.playerid)){
-    		sendNotice("", "buttons operation is GM priviledged");
-    		return ;
-    	}
-    	var domacro = function(attrs){
-    		var found = findObjs({ _type: "macro", name: attrs.name });
-    		if( found && found.length > 0 ) return attrs.name + " macro already exists";
-    		if(!createObj("macro", attrs )) return attrs.name + " macro not created";
-    		return attrs.name + " macro created";
+	function dumpOperation(msg){ // for debugging
+		// check for gm here
+		if(!playerIsGM(msg.playerid)){
+			sendNote("dump operation is GM priviledged", msg);
+			return ;
+		}
+		log(pwTokens.data());
+	};
 
-    	};
-    	sendNotice( "", domacro({ _playerid : msg.playerid, name : "[Learn]", 
-    		action : "!mimic -learn", visibleto: "", istokenaction : true }));
-    	sendNotice( "", domacro({ _playerid : msg.playerid, name : "[Perform]", 
-    		action : "!mimic -perform", visibleto: "", istokenaction : true }));
-    }
-    
-    // END OF script input commands
-    
+	function resetOperation(msg){
+		if(!playerIsGM(msg.playerid)){
+			sendNote("reset operation is GM priviledged", msg);
+			return ;
+		}
+		pwTokens.reset();
+		sendNote("Tokens now forget what they learned.", msg);
+	}
+
+	function cleanOperation(msg){
+		if(!playerIsGM(msg.playerid)){
+			sendNote("clean operation is GM priviledged", msg);
+			return ;
+		}
+		pwTokens.clean();
+		sendNote("Deleted token memory clean-up finished.", msg);
+	};
+
+	function buttonsOperation(msg){
+		if(!playerIsGM(msg.playerid)){
+			sendNote("buttons operation is GM priviledged", msg);
+			return ;
+		}
+		var domacro = function(attrs){
+			var found = findObjs({ _type: "macro", name: attrs.name });
+			if( found && found.length > 0 ) return attrs.name + " macro already exists";
+			if(!createObj("macro", attrs )) return attrs.name + " macro not created";
+			return attrs.name + " macro created";
+
+		};
+		sendNote( domacro({ _playerid : msg.playerid, name : "[Learn]", 
+			action : "!mimic -learn", visibleto: "", istokenaction : true }), msg);
+		sendNote( domacro({ _playerid : msg.playerid, name : "[Perform]", 
+			action : "!mimic -perform", visibleto: "", istokenaction : true }), msg);
+	}
+
+	// END OF script input commands
+
 	var registerEventHandlers = function() {
-		msgStorage.clean(); // should be on sandbox spinup, not needed for each player.
+		pwTokens.clean(); // should be on sandbox spinup, not needed for each player.
 		on('chat:message', handleMsgInput);
+		log("!mimic: chat handler installed");
 	};
 
 	return {
 		// CheckInstall: checkInstall,
 		RegisterEventHandlers: registerEventHandlers,
+
 	};
-	
+
 }());
 
 on('ready',function() {
